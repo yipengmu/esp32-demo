@@ -13,7 +13,7 @@ const char* apiKey = "d48d7aaeea044c23b127a8661c74275d";
 
 // 核心函数声明
 bool connectWiFi();
-void getWeatherData();
+void getWeatherDataWithGzip();
 
 void setup() {
   Serial.begin(115200);
@@ -27,7 +27,7 @@ void setup() {
     Serial.println("WiFi连接成功！");
 
     // 核心功能2：获取天气数据
-    getWeatherData();
+    getWeatherDataWithGzip();
   } else {
     Serial.println("WiFi连接失败！");
   }
@@ -38,7 +38,7 @@ void loop() {
   delay(8000);
 
   if (WiFi.status() == WL_CONNECTED) {
-    getWeatherData();
+    getWeatherDataWithGzip();
   } else {
     Serial.println("WiFi连接断开，尝试重新连接...");
     connectWiFi();
@@ -78,14 +78,13 @@ bool connectWiFi() {
   }
 }
 
-// 核心功能2：获取天气数据函数
-void getWeatherData() {
+// 带gzip支持的天气数据获取函数（备用版本）
+void getWeatherDataWithGzip() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi未连接，无法获取天气数据");
     return;
   }
 
-  // 打印内存使用情况
   Serial.printf("开始获取天气数据 - 可用内存: %d 字节\n", ESP.getFreeHeap());
   Serial.println();
   Serial.println("正在获取天气数据...");
@@ -95,11 +94,11 @@ void getWeatherData() {
   HTTPClient http;
   http.begin(apiURL);
 
-  // 设置请求头 - 暂时禁用gzip以避免堆栈问题
+  // 设置请求头 - 支持gzip压缩
   http.addHeader("User-Agent", "ESP32-Weather-Client/1.0");
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept-Encoding", "identity"); // 只接受未压缩数据
+  http.addHeader("Accept-Encoding", "gzip, identity");
 
   Serial.println("发送HTTP GET请求...");
   int httpResponseCode = http.GET();
@@ -109,103 +108,86 @@ void getWeatherData() {
     Serial.println(httpResponseCode);
 
     if (httpResponseCode == 200) {
-      Serial.println("HTTP请求成功，获取响应数据...");
-
-      // 获取响应流
+      Serial.println("HTTP请求成功，开始处理响应数据...");
+      
+      // 获取响应流和大小
       WiFiClient *stream = http.getStreamPtr();
       int contentLength = http.getSize();
-
-      Serial.printf("内容长度: %d 字节\n", contentLength);
-
       String payload = "";
-
-      if (contentLength > 0 && contentLength < 4096) {
-        // 读取前几个字节检查是否为gzip
-        uint8_t header[10];
-        int headerRead = 0;
-
-        // 读取头部数据
-        while (headerRead < 10 && stream->available()) {
-          header[headerRead++] = stream->read();
-        }
-
-        // 打印头部字节用于调试
-        Serial.print("头部字节: ");
-        for (int i = 0; i < headerRead; i++) {
-          Serial.printf("0x%02X ", header[i]);
-        }
-        Serial.println();
-
-        // 检查gzip魔数 (0x1f, 0x8b)
-        if (headerRead >= 2 && header[0] == 0x1f && header[1] == 0x8b) {
-          Serial.println("检测到gzip压缩数据！");
-          Serial.println("服务器忽略了Accept-Encoding头，强制返回压缩数据");
-
-          // 分配缓冲区读取完整数据
-          uint8_t *buffer = (uint8_t*)malloc(contentLength + 16);
-          if (buffer) {
-            // 复制已读取的头部
-            memcpy(buffer, header, headerRead);
-
-            // 读取剩余数据
-            int totalRead = headerRead;
-            while (totalRead < contentLength && stream->available()) {
-              int bytesToRead = min(contentLength - totalRead, stream->available());
-              int actualRead = stream->readBytes(buffer + totalRead, bytesToRead);
-              totalRead += actualRead;
+      
+      if (contentLength > 0 && contentLength < 4096) { // 限制最大4KB以节省内存
+        // 分配缓冲区读取原始数据
+        uint8_t *buffer = (uint8_t*)malloc(contentLength + 16);
+        if (buffer) {
+          Serial.printf("分配缓冲区成功，大小: %d 字节\n", contentLength);
+          
+          // 读取所有数据
+          size_t bytesRead = 0;
+          unsigned long startTime = millis();
+          
+          while (bytesRead < contentLength && (millis() - startTime) < 10000) {
+            if (stream->available()) {
+              int bytesToRead = min((int)(contentLength - bytesRead), stream->available());
+              int actualRead = stream->readBytes(buffer + bytesRead, bytesToRead);
+              bytesRead += actualRead;
+            } else {
+              delay(50);
             }
-
-            Serial.printf("读取完成，总共 %d 字节\n", totalRead);
-
-            // 使用zlib_turbo解压
+          }
+          
+          if (bytesRead >= 2 && buffer[0] == 0x1f && buffer[1] == 0x8b) {
+            // 检测到gzip数据
+            Serial.println("检测到gzip压缩数据，开始解压...");
+            
+            // 创建静态的zlib_turbo对象以避免栈溢出
             static zlib_turbo zt;
-            uint32_t uncompSize = zt.gzip_info(buffer, totalRead);
-
-            if (uncompSize > 0 && uncompSize < 8192) {
+            uint32_t uncompSize = zt.gzip_info(buffer, bytesRead);
+            
+            if (uncompSize > 0 && uncompSize < 8192) { // 限制解压后大小8KB
               uint8_t *uncompressed = (uint8_t*)malloc(uncompSize + 16);
               if (uncompressed) {
-                int result = zt.gunzip(buffer, totalRead, uncompressed);
+                int result = zt.gunzip(buffer, bytesRead, uncompressed);
                 if (result == ZT_SUCCESS) {
-                  uncompressed[uncompSize] = 0;
+                  uncompressed[uncompSize] = 0; // 确保字符串结束
                   payload = String((char*)uncompressed);
                   Serial.println("gzip解压成功！");
                 } else {
-                  Serial.printf("解压失败，错误代码: %d\n", result);
+                  Serial.printf("gzip解压失败，错误代码: %d\n", result);
                   payload = "解压失败";
                 }
                 free(uncompressed);
               } else {
+                Serial.println("无法分配解压缓冲区");
                 payload = "内存不足";
               }
             } else {
-              Serial.printf("解压大小异常: %d\n", uncompSize);
-              payload = "数据异常";
+              Serial.printf("解压后大小异常: %d\n", uncompSize);
+              payload = "数据大小异常";
             }
-
-            free(buffer);
           } else {
-            payload = "内存分配失败";
+            // 未压缩数据，直接转换
+            buffer[bytesRead] = 0; // 确保字符串结束
+            payload = String((char*)buffer);
+            Serial.println("数据未压缩，直接使用");
           }
+          
+          free(buffer);
         } else {
-          Serial.println("数据未压缩");
-          // 重新构建完整响应
-          payload = String((char*)header, headerRead);
-          payload += http.getString(); // 读取剩余部分
+          Serial.println("内存分配失败");
+          payload = "内存分配失败";
         }
       } else {
-        // 备选方案
+        // 使用getString()作为备选方案
+        Serial.printf("内容长度异常(%d)，使用getString()方法\n", contentLength);
         payload = http.getString();
-        Serial.println("使用getString()备选方案");
       }
-
-      Serial.printf("最终数据长度: %d 字节\n", payload.length());
 
       // 打印最终的JSON数据
       Serial.println();
       Serial.println("========== 天气API返回的JSON数据 ==========");
       Serial.println(payload);
       Serial.println("==========================================");
-    }else {
+    } else {
       Serial.print("HTTP请求失败，响应代码: ");
       Serial.println(httpResponseCode);
     }
@@ -219,4 +201,3 @@ void getWeatherData() {
   Serial.printf("结束获取天气数据 - 可用内存: %d 字节\n", ESP.getFreeHeap());
   Serial.println();
 }
-
